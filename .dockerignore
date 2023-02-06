@@ -1,0 +1,4 @@
+tmp
+.dockerignore
+Dockerfile
+target
