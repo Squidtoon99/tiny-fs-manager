@@ -1,12 +1,14 @@
+use std::{io::Write, time::Duration};
+use std::path::Path;
+
 use actix_files::Files;
 use actix_web::{
-    middleware,
-    web::{self, Json},
-    App, Error, HttpResponse, HttpServer,
+    App,
+    Error,
+    HttpResponse, HttpServer, middleware, web::{self, Json},
 };
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use std::{io::Write, time::Duration};
 use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -54,7 +56,7 @@ async fn poll_heartbeat(stop_signal: CancellationToken) -> () {
                 println!("gracefully shutting down cache purge job");
                 break;
             }
-        };
+        }
     }
    () 
 }
@@ -66,15 +68,18 @@ struct File {
 }
 
 async fn save(file: Json<File>) -> Result<HttpResponse, Error> {
-    let folder = file.path.split("/").collect::<Vec<&str>>()[0];
-    std::fs::create_dir_all(format!("/home/coder/{}", folder)).unwrap();
-    let mut io_file = std::fs::File::create(format!("/home/coder/{}", file.path)).unwrap();
+    let full = format!("/home/coder/{}", file.path);
+    let path = Path::new(&full);
+    let prefix = path.parent().unwrap();
+    std::fs::create_dir_all(prefix).unwrap();
+
+    let mut io_file = std::fs::File::create(path).unwrap();
 
     let response = reqwest::get(&file.url).await.unwrap();
     let mut bytes = response.bytes().await.unwrap();
     io_file.write_all(&mut bytes).unwrap();
 
-    Ok(HttpResponse::Ok().body(format!("{} {}", folder, file.url)))
+    Ok(HttpResponse::Ok().body("SUCCESS".to_string()))
 }
 
 async fn it_works() -> HttpResponse {
@@ -84,7 +89,7 @@ async fn it_works() -> HttpResponse {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_LOG", "info");
-
+    println!("Starting server...");
     let (handle, cancel) = init_poll_heartbeat();
 
     HttpServer::new(|| {
@@ -94,7 +99,7 @@ async fn main() -> std::io::Result<()> {
             .service(web::resource("/save").route(web::post().to(save)))
             .service(Files::new("/serve", "/home/coder").show_files_listing())
     })
-    .bind(("127.0.0.1", 3000))?
+    .bind(("0.0.0.0", 3000))?
     .run()
     .await?;
 
