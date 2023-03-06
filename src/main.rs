@@ -46,7 +46,7 @@ async fn poll_heartbeat(stop_signal: CancellationToken) {
             if diff.as_secs() > 60 && running {
                 //  curl -d '{"action":"delete"}' -H 'Content-Type: application/json' -X POST https://code.squid.pink/api/v1/{USER}/
                 let res = client
-                    .post(&format!("https://code.squid.pink/api/v1/deployments/{}/token-bypass", *USER))
+                    .post(&format!("https://code.squid.pink/api/v1/deployments/{}/", *USER))
                     .json(&serde_json::json!({"action": "stop"}))
                     .header("Authentication", format!("{}", *API_KEY))
                     .send()
@@ -85,7 +85,7 @@ async fn poll_server(stop_signal: CancellationToken) {
     let client = reqwest::Client::new();
     loop {
         let res = client
-            .get(format!("https://code.squid.pink/apps/file-sync/{}/", *USER).as_str())
+            .get(format!("https://code.squid.pink/api/v1/apps/file-sync/{}/", *USER).as_str())
             .header("Authentication", format!("{}", *API_KEY))
             .send()
             .await;
@@ -121,6 +121,19 @@ async fn poll_server(stop_signal: CancellationToken) {
                         let perms = permissions.mode() | 0o666;
                         std::fs::set_permissions(path, std::fs::Permissions::from_mode(perms)).unwrap();
                     }
+
+                //     sent a post request to /apps/file-sync/{User}/ with the data {file_id: file_id}
+                    client.post(format!(
+                        "https://code.squid.pink/api/v1/apps/file-sync/{}/",
+                        *USER
+                    ).as_str())
+                        .json(&serde_json::json!({"file_id": file.id}))
+                        .header("Authentication", format!("{}", *API_KEY))
+                        .send()
+                        .await
+                        .unwrap();
+
+
                 }
             }
             Err(err) => {
@@ -143,6 +156,7 @@ async fn poll_server(stop_signal: CancellationToken) {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct File {
+    id: i32,
     url: String,
     path: String,
 }
