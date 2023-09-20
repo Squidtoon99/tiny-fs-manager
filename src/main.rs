@@ -15,6 +15,8 @@ use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
 
 lazy_static! {
+    static ref API_URL: String = std::env::var("API_URL").unwrap_or("https://code.squid.pink/api/v1".to_string());
+
     static ref USER: String = std::env::var("VS_USER").unwrap();
     static ref SECRET_KEY: String = std::env::var("SECRET_KEY").unwrap();
     static ref API_KEY: String = format!("{}:{}", *USER, *SECRET_KEY);
@@ -38,6 +40,17 @@ fn init_tasks() -> (JoinHandle<()>, CancellationToken) {
 async fn poll_heartbeat(stop_signal: CancellationToken) {
     let client = reqwest::Client::new();
     let mut running = true;
+    tokio::select! {
+            _ = sleep(Duration::from_secs(60)) => {
+                println!("Starting heartbeat check");
+            }
+
+            _ = stop_signal.cancelled() => {
+                println!("gracefully shutting down cache purge job");
+                return;
+            }
+        }
+
     loop {
         if let Ok(file) = std::fs::metadata("/home/coder/.local/share/code-server/heartbeat") {
             let last_modified = file.modified().unwrap();
@@ -46,9 +59,9 @@ async fn poll_heartbeat(stop_signal: CancellationToken) {
             if diff.as_secs() > 60 && running {
                 //  curl -d '{"action":"delete"}' -H 'Content-Type: application/json' -X POST https://code.squid.pink/api/v1/{USER}/
                 let res = client
-                    .post(&format!("https://code.squid.pink/api/v1/deployments/{}/", *USER))
+                    .post(&format!("{}/deployments/{}", *API_URL, *USER))
                     .json(&serde_json::json!({"action": "stop"}))
-                    .header("Authentication", format!("{}", *API_KEY))
+                    .header("Authorization", format!("{}", *API_KEY))
                     .send()
                     .await;
 
@@ -84,54 +97,81 @@ async fn poll_heartbeat(stop_signal: CancellationToken) {
 async fn poll_server(stop_signal: CancellationToken) {
     let client = reqwest::Client::new();
     loop {
+        println!("fetching files from server with API KEY: {}", *API_KEY);
         let res = client
-            .get(format!("https://code.squid.pink/api/v1/apps/file-sync/{}/", *USER).as_str())
-            .header("Authentication", format!("{}", *API_KEY))
+            .get(format!("{}/apps/file-sync/{}/", *API_URL, *USER).as_str())
+            .header("Authorization", format!("{}", *API_KEY))
             .send()
             .await;
 
         match res {
             Ok(res) => {
                 let body = res.text().await.unwrap();
-                let files: Vec<File> = serde_json::from_str(&body).unwrap();
+                let files: Vec<File> =
+                    match serde_json::from_str(&body) {
+                        Ok(files) => files,
+                        Err(err) => {
+                            eprintln!("[ERR]\t[PARSING FILES] {:?}", err);
+                            eprintln!("body: {}", body);
+                            sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    };
+
                 for file in files {
                     let full = format!("/home/coder/{}", file.path);
                     let path = Path::new(&full);
                     let prefix = path.parent().unwrap();
                     std::fs::create_dir_all(prefix).unwrap();
 
-                    let mut io_file = std::fs::File::create(path).unwrap();
-
                     let response = reqwest::get(&file.url).await.unwrap();
                     let mut bytes = response.bytes().await.unwrap();
-                    // if file is json replace {VS_USER} with the actual user
-                    if file.path.ends_with(".json") {
-                        let mut content = String::from_utf8(bytes.to_vec()).unwrap();
-                        content = content.replace("{VS_USER}", &*USER);
-                        bytes = Bytes::from(content);
-                    }
-                    io_file.write_all(&mut bytes).unwrap();
+                    // If the file currently exists, check if it's the same as the one on the server
+                    if path.exists() {
+                        println!("[OK]\t[FILE EXISTS] {}", file.path);
 
-                    let permissions = std::fs::metadata(path).unwrap().permissions();
-                    // Allow everyone to read and write
-                    if file.path.contains(".code") {
-                        let perms = permissions.mode() | 0o744;
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(perms)).unwrap();
                     } else {
-                        let perms = permissions.mode() | 0o666;
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(perms)).unwrap();
-                    }
+                        let mut io_file = std::fs::File::create(path).unwrap();
 
+
+                        // if file is json replace {VS_USER} with the actual user
+                        if file.path.ends_with(".json") {
+                            let mut content = String::from_utf8(bytes.to_vec()).unwrap();
+                            content = content.replace("{VS_USER}", &*USER);
+                            bytes = Bytes::from(content);
+                        }
+                        io_file.write_all(&mut bytes).unwrap();
+
+                        let permissions = std::fs::metadata(path).unwrap().permissions();
+                        // Allow everyone to read and write
+                        if file.path.contains(".code") {
+                            let perms = permissions.mode() | 0o744;
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(perms)).unwrap();
+                        } else {
+                            let perms = permissions.mode() | 0o666;
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(perms)).unwrap();
+                        }
+                    }
                 //     sent a post request to /apps/file-sync/{User}/ with the data {file_id: file_id}
-                    client.post(format!(
-                        "https://code.squid.pink/api/v1/apps/file-sync/{}/",
+                    match client.post(&format!(
+                        "{}/apps/file-sync/{}/",
+                        *API_URL,
                         *USER
-                    ).as_str())
+                    ))
                         .json(&serde_json::json!({"file_id": file.id}))
-                        .header("Authentication", format!("{}", *API_KEY))
+                        .header("Authorization", format!("{}", *API_KEY))
                         .send()
                         .await
-                        .unwrap();
+                        .unwrap()
+                        .json::<serde_json::Value>()
+                        .await {
+                            Ok(res) => {
+                                println!("[OK]\t[FILE SYNCED] {:?}", res);
+                            }
+                            Err(err) => {
+                                eprintln!("[ERR]\t[FILE SYNCED] {:?}", err);
+                            }
+                    }
 
 
                 }
